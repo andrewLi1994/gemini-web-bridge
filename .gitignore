@@ -15,3 +15,5 @@ Chrome Profile/
 DevToolsActivePort
 settings.json
 sessions.json
+conversations.json
+locks/

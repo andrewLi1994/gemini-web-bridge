@@ -106,7 +106,7 @@ export async function submitGeminiPrompt(prompt, requestMarker) {
       markerRendered &&
       !editorText.includes(requestMarker)
     ) {
-      return { before, titleBefore };
+      return { before, titleBefore, url: location.href };
     }
     await wait(150);
   }
