@@ -8,7 +8,13 @@ import {
   readGeminiGenerationState,
   submitGeminiPrompt,
 } from "./gemini-page.mjs";
-import { getSession, paths, saveSession } from "./state-store.mjs";
+import { withFileLock } from "./operation-lock.mjs";
+import {
+  findLegacyConversation,
+  getConversation,
+  paths,
+  saveConversation,
+} from "./state-store.mjs";
 import { buildGeminiPrompt, canonicalizeYoutubeUrl } from "./youtube.mjs";
 
 const CHROME_CANDIDATES = [
@@ -21,53 +27,108 @@ const GEMINI_HOME = "https://gemini.google.com/app";
 const ANSWER_TIMEOUT_MS = 3 * 60_000;
 const NO_RESPONSE_TIMEOUT_MS = 90_000;
 const STALLED_RESPONSE_TIMEOUT_MS = 45_000;
+const LOGIN_TIMEOUT_MS = 10 * 60_000;
+const MAX_PROMPT_CHARS = 16_000;
+
+export const BRIDGE_PHASES = {
+  GENERATING: "GENERATING",
+  PRE_SUBMIT: "PRE_SUBMIT",
+  SUBMITTED: "SUBMITTED",
+};
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class GeminiBridgeError extends Error {
-  constructor(code, message, { partialChars = 0, retryable = false } = {}) {
+  constructor(
+    code,
+    message,
+    {
+      conversationId = null,
+      conversationUrl = null,
+      partialChars = 0,
+      phase = BRIDGE_PHASES.PRE_SUBMIT,
+      retrySafe = false,
+    } = {},
+  ) {
     super(message);
     this.name = "GeminiBridgeError";
     this.code = code;
+    this.conversationId = conversationId;
+    this.conversationUrl = conversationUrl;
     this.partialChars = partialChars;
-    this.retryable = retryable;
+    this.phase = phase;
+    this.retrySafe = retrySafe;
+    this.retryable = retrySafe;
   }
 }
 
-function normalizeBridgeError(error) {
-  if (error instanceof GeminiBridgeError) return error;
+function errorOptions(context, overrides = {}) {
+  return {
+    conversationId: context.conversationId ?? null,
+    conversationUrl: context.conversationUrl ?? null,
+    phase: context.phase ?? BRIDGE_PHASES.PRE_SUBMIT,
+    ...overrides,
+  };
+}
+
+function normalizeBridgeError(error, context = {}) {
+  if (error instanceof GeminiBridgeError) {
+    if (error.conversationId == null) error.conversationId = context.conversationId ?? null;
+    if (error.conversationUrl == null) error.conversationUrl = context.conversationUrl ?? null;
+    return error;
+  }
   const message = error instanceof Error ? error.message : String(error);
-  if (/取消|aborted/i.test(message)) {
-    return new GeminiBridgeError("CANCELLED", "Gemini 分析已取消。");
+  const phase = context.phase ?? BRIDGE_PHASES.PRE_SUBMIT;
+  if (/取消|cancelled|aborted/i.test(message) || error?.code === "CANCELLED") {
+    return new GeminiBridgeError("CANCELLED", "Gemini analysis was cancelled.", errorOptions(context));
+  }
+  if (error?.code === "LOCK_TIMEOUT") {
+    return new GeminiBridgeError(
+      "BRIDGE_BUSY",
+      "Timed out waiting for another Gemini Web Bridge operation to finish.",
+      errorOptions(context),
+    );
+  }
+  if (["AUTHORIZATION_REQUIRED", "CONVERSATION_NOT_FOUND", "INVALID_INPUT"].includes(error?.code)) {
+    return new GeminiBridgeError(error.code, message, errorOptions(context));
   }
   if (/连接已关闭|fetch failed|ECONN|WebSocket|socket/i.test(message)) {
+    const submitted = phase !== BRIDGE_PHASES.PRE_SUBMIT;
     return new GeminiBridgeError(
-      "BROWSER_DISCONNECTED",
-      "后台浏览器连接意外断开。",
-      { retryable: true },
+      submitted ? "OUTCOME_UNKNOWN" : "BROWSER_DISCONNECTED",
+      submitted
+        ? "The browser connection closed after submission may have started; the outcome is unknown."
+        : "The browser connection closed before submission.",
+      errorOptions(context, { retrySafe: !submitted }),
     );
   }
-  if (/没有开始生成/i.test(message)) {
+  if (/超时|timed out/i.test(message)) {
+    const submitted = phase !== BRIDGE_PHASES.PRE_SUBMIT;
     return new GeminiBridgeError(
-      "NO_RESPONSE",
-      "Gemini 已接收输入，但没有开始生成回答。",
-      { retryable: true },
+      submitted ? "OUTCOME_UNKNOWN" : "BROWSER_TIMEOUT",
+      submitted ? "A browser call timed out after submission may have started; the outcome is unknown." : message,
+      errorOptions(context, { retrySafe: !submitted }),
     );
   }
-  if (/超时/i.test(message)) {
-    return new GeminiBridgeError("BROWSER_TIMEOUT", message, { retryable: true });
+  if (/没有开始生成|did not start generating/i.test(message) && phase !== BRIDGE_PHASES.PRE_SUBMIT) {
+    return new GeminiBridgeError(
+      "OUTCOME_UNKNOWN",
+      "Gemini accepted the page interaction but generation did not become observable; the outcome is unknown.",
+      errorOptions(context),
+    );
   }
   if (/找不到 Gemini 输入框|找不到可用的 Gemini 发送按钮/i.test(message)) {
     return new GeminiBridgeError(
       "UI_CHANGED",
-      "Gemini Web 页面结构可能已变化，Bridge 找不到输入或发送控件。",
+      "Gemini Web may have changed its page structure; the input or send control was not found.",
+      errorOptions(context),
     );
   }
-  return new GeminiBridgeError("UNEXPECTED", message);
+  return new GeminiBridgeError("UNEXPECTED", message, errorOptions(context));
 }
 
 export function shouldRetryBridgeError(error, attempt, aborted = false) {
-  return attempt === 0 && error?.retryable === true && !aborted;
+  return attempt === 0 && error?.retrySafe === true && !aborted;
 }
 
 async function fileExists(path) {
@@ -83,7 +144,7 @@ async function fetchTargets(port) {
   const response = await fetch(`http://127.0.0.1:${port}/json/list`, {
     signal: AbortSignal.timeout(1_500),
   });
-  if (!response.ok) throw new Error(`Chrome 调试端点返回 ${response.status}`);
+  if (!response.ok) throw new Error(`Chrome debugging endpoint returned ${response.status}.`);
   return response.json();
 }
 
@@ -91,10 +152,10 @@ async function fetchBrowserWebSocket(port) {
   const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
     signal: AbortSignal.timeout(1_500),
   });
-  if (!response.ok) throw new Error(`Chrome 浏览器端点返回 ${response.status}`);
+  if (!response.ok) throw new Error(`Chrome browser endpoint returned ${response.status}.`);
   const version = await response.json();
   if (typeof version.webSocketDebuggerUrl !== "string") {
-    throw new Error("Chrome 浏览器端点缺少 WebSocket URL。");
+    throw new Error("Chrome browser endpoint did not provide a WebSocket URL.");
   }
   return version.webSocketDebuggerUrl;
 }
@@ -107,6 +168,27 @@ async function readActivePort() {
   } catch {
     return null;
   }
+}
+
+function isSpecificConversationUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.origin === "https://gemini.google.com" && /^\/app\/[^/]+/.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function cleanPrompt(value) {
+  const prompt = String(value).trim();
+  if (prompt.length === 0) throw new GeminiBridgeError("INVALID_INPUT", "Prompt cannot be empty.");
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    throw new GeminiBridgeError(
+      "INVALID_INPUT",
+      `Prompt is too long; keep it within ${MAX_PROMPT_CHARS} characters.`,
+    );
+  }
+  return prompt;
 }
 
 export class GeminiBrowserBridge {
@@ -135,29 +217,6 @@ export class GeminiBrowserBridge {
     return null;
   }
 
-  async launchHumanLogin() {
-    const executable = await this.findBrowser();
-    if (executable == null) {
-      throw new Error("没有找到兼容浏览器。本机版本暂未实现自动下载，请先安装 Google Chrome。");
-    }
-    await this.shutdownBrowser(await readActivePort());
-    spawn(
-      executable,
-      [
-        `--user-data-dir=${paths.profile}`,
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--new-window",
-        GEMINI_HOME,
-      ],
-      { detached: true, stdio: "ignore" },
-    ).unref();
-    return {
-      profile: paths.profile,
-      message: "请在打开的普通 Chrome 窗口登录 Gemini，确认能正常对话后关闭整个专用 Chrome 窗口。",
-    };
-  }
-
   async shutdownBrowser(port) {
     if (port == null) return;
     try {
@@ -180,31 +239,11 @@ export class GeminiBrowserBridge {
     } catch {}
   }
 
-  async startBrowser() {
-    await this.shutdownBrowser(await readActivePort());
-    const executable = await this.findBrowser();
-    if (executable == null) {
-      throw new Error("没有找到兼容浏览器。本机版本暂未实现自动下载，请先安装 Google Chrome。");
-    }
-    spawn(
-      executable,
-      [
-        `--user-data-dir=${paths.profile}`,
-        "--headless=new",
-        "--remote-debugging-address=127.0.0.1",
-        "--remote-debugging-port=0",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--window-size=1440,1000",
-        "about:blank",
-      ],
-      { detached: true, stdio: "ignore" },
-    ).unref();
-
-    let port = null;
-    const deadline = Date.now() + 30_000;
+  async waitForBrowserPort(signal, timeoutMs = 30_000) {
+    const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      port = await readActivePort();
+      if (signal?.aborted) throw new GeminiBridgeError("CANCELLED", "Operation cancelled.");
+      const port = await readActivePort();
       if (port != null) {
         try {
           await fetchTargets(port);
@@ -213,7 +252,38 @@ export class GeminiBrowserBridge {
       }
       await delay(250);
     }
-    throw new Error("Chrome 已启动，但本机调试入口没有就绪。");
+    throw new GeminiBridgeError(
+      "BROWSER_TIMEOUT",
+      "Chrome started, but its local debugging endpoint did not become ready.",
+      { retrySafe: true },
+    );
+  }
+
+  async spawnBrowser({ headless, signal }) {
+    await this.shutdownBrowser(await readActivePort());
+    const executable = await this.findBrowser();
+    if (executable == null) {
+      throw new GeminiBridgeError(
+        "BROWSER_NOT_FOUND",
+        "No compatible browser was found. Install Google Chrome before using Gemini Web Bridge.",
+      );
+    }
+    const args = [
+      `--user-data-dir=${paths.profile}`,
+      "--remote-debugging-address=127.0.0.1",
+      "--remote-debugging-port=0",
+      "--no-first-run",
+      "--no-default-browser-check",
+      "--window-size=1440,1000",
+    ];
+    if (headless) args.push("--headless=new", "about:blank");
+    else args.push("--new-window", GEMINI_HOME);
+    spawn(executable, args, { detached: true, stdio: "ignore" }).unref();
+    return this.waitForBrowserPort(signal);
+  }
+
+  async startBrowser(signal) {
+    return this.spawnBrowser({ headless: true, signal });
   }
 
   async openTarget(port) {
@@ -221,7 +291,7 @@ export class GeminiBrowserBridge {
       `http://127.0.0.1:${port}/json/new?${encodeURIComponent("about:blank")}`,
       { method: "PUT", signal: AbortSignal.timeout(2_000) },
     );
-    if (!response.ok) throw new Error("无法创建 Gemini 浏览器标签页。");
+    if (!response.ok) throw new Error("Unable to create a Gemini browser tab.");
     const target = await response.json();
     const client = new CdpClient(target.webSocketDebuggerUrl);
     await client.connect();
@@ -236,12 +306,12 @@ export class GeminiBrowserBridge {
       expectedUrl === GEMINI_HOME ? null : new URL(expectedUrl).pathname.replace(/\/$/, "");
     let readyChecks = 0;
     while (Date.now() < deadline) {
-      if (signal?.aborted) throw new Error("Gemini 分析已取消。");
+      if (signal?.aborted) throw new GeminiBridgeError("CANCELLED", "Operation cancelled.");
       const page = await client.call(inspectGeminiPage.toString());
       if (page?.signedOut === true || /accounts\.google\.com/i.test(page?.url ?? "")) {
         throw new GeminiBridgeError(
           "LOGIN_REQUIRED",
-          "请先调用 gemini_web_login，在普通 Chrome 中登录，关闭该专用窗口后重试。",
+          "Sign in to Gemini in the dedicated browser window, close it, and retry.",
         );
       }
       if (
@@ -259,39 +329,126 @@ export class GeminiBrowserBridge {
     }
     throw new GeminiBridgeError(
       "COMPOSER_TIMEOUT",
-      "等待 Gemini 输入框超时；页面可能未完成加载。",
-      { retryable: true },
+      "Timed out waiting for the Gemini input box.",
+      { retrySafe: true },
     );
   }
 
-  async waitForAnswer(client, before, onProgress, signal) {
+  async verifyLogin(onProgress, signal) {
+    let client = null;
+    let port = null;
+    try {
+      port = await this.startBrowser(signal);
+      ({ client } = await this.openTarget(port));
+      await client.send("Page.navigate", { url: GEMINI_HOME });
+      await onProgress?.("Verifying the Gemini login.", 90);
+      await this.waitForComposer(client, onProgress, signal, GEMINI_HOME);
+      return true;
+    } finally {
+      client?.close();
+      await this.shutdownBrowser(port);
+    }
+  }
+
+  async launchHumanLogin({ signal, wait = true } = {}, onProgress) {
+    return withFileLock(
+      paths.browserLock,
+      { label: "Gemini Web browser", signal },
+      async () => {
+        const port = await this.spawnBrowser({ headless: false, signal });
+        await onProgress?.(
+          "Sign in to Gemini in the visible browser, then close the entire dedicated window.",
+          10,
+        );
+        if (!wait) {
+          return { loginVerified: false, message: "Gemini login window opened.", profile: paths.profile };
+        }
+
+        const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+        let interactivePageObserved = false;
+        while (Date.now() < deadline) {
+          if (signal?.aborted) {
+            await this.shutdownBrowser(port);
+            throw new GeminiBridgeError("CANCELLED", "Login was cancelled.");
+          }
+          try {
+            const targets = await fetchTargets(port);
+            const pages = targets.filter(({ type }) => type === "page");
+            if (pages.some(({ url }) => /gemini\.google\.com|accounts\.google\.com/i.test(url ?? ""))) {
+              interactivePageObserved = true;
+            }
+            if (interactivePageObserved && pages.length === 0) {
+              await this.shutdownBrowser(port);
+              await delay(500);
+              const loginVerified = await this.verifyLogin(onProgress, signal);
+              return {
+                loginVerified,
+                message: "Gemini login verified.",
+                profile: paths.profile,
+              };
+            }
+          } catch {
+            await delay(500);
+            const loginVerified = await this.verifyLogin(onProgress, signal);
+            return {
+              loginVerified,
+              message: "Gemini login verified.",
+              profile: paths.profile,
+            };
+          }
+          await delay(750);
+        }
+        await this.shutdownBrowser(port);
+        throw new GeminiBridgeError(
+          "LOGIN_TIMEOUT",
+          "The Gemini login window remained open for more than 10 minutes.",
+        );
+      },
+    );
+  }
+
+  async waitForAnswer(client, before, onProgress, signal, context) {
     const startedAt = Date.now();
     const deadline = startedAt + ANSWER_TIMEOUT_MS;
     let lastChangedAt = startedAt;
     let lastText = "";
+    let lastUrl = context.conversationUrl;
     let stableChecks = 0;
     let ticks = 0;
     while (Date.now() < deadline) {
-      if (signal?.aborted) throw new Error("Gemini 分析已取消。");
+      if (signal?.aborted) {
+        throw new GeminiBridgeError("CANCELLED", "Generation was cancelled.", {
+          ...context,
+          conversationUrl: lastUrl,
+          partialChars: lastText.length,
+          phase: lastText.length > 0 ? BRIDGE_PHASES.GENERATING : BRIDGE_PHASES.SUBMITTED,
+        });
+      }
       const state = await client.call(readGeminiGenerationState.toString(), [before]);
+      lastUrl = state.url ?? lastUrl;
+      const phase = lastText.length > 0 ? BRIDGE_PHASES.GENERATING : BRIDGE_PHASES.SUBMITTED;
       if (state.failure?.kind === "RATE_LIMITED") {
-        throw new GeminiBridgeError(
-          "RATE_LIMITED",
-          "Gemini Web 当前达到使用限额，请稍后再试或在专用登录窗口中检查账号额度。",
-        );
+        throw new GeminiBridgeError("RATE_LIMITED", "Gemini Web reached the account usage limit.", {
+          ...context,
+          conversationUrl: lastUrl,
+          partialChars: lastText.length,
+          phase,
+        });
       }
       if (state.failure?.kind === "INTERACTION_REQUIRED") {
         throw new GeminiBridgeError(
           "INTERACTION_REQUIRED",
-          "Gemini 要求人工验证，请调用 gemini_web_login 完成验证后重试。",
+          "Gemini requires manual verification in the dedicated browser.",
+          { ...context, conversationUrl: lastUrl, partialChars: lastText.length, phase },
         );
       }
       if (state.failure?.kind === "TRANSIENT") {
-        throw new GeminiBridgeError(
-          "GEMINI_TRANSIENT",
-          "Gemini Web 显示临时生成错误。",
-          { partialChars: lastText.length, retryable: true },
-        );
+        throw new GeminiBridgeError("GEMINI_TRANSIENT", "Gemini Web displayed a generation error.", {
+          ...context,
+          conversationUrl: lastUrl,
+          partialChars: lastText.length,
+          phase,
+        });
       }
       if (state.isNew && state.snapshot.text === lastText) {
         stableChecks += 1;
@@ -304,66 +461,80 @@ export class GeminiBrowserBridge {
       }
       ticks += 1;
       if (ticks % 8 === 0) {
-        await onProgress?.(`Gemini 正在生成，已收到 ${lastText.length} 个字符。`, 50);
+        await onProgress?.(`Gemini is generating; received ${lastText.length} characters.`, 50);
       }
       const completeByControls =
         state.isNew &&
         !state.stopVisible &&
         state.snapshot.completedCount > (before?.completedCount ?? 0);
       if (lastText.length > 0 && stableChecks >= 4 && completeByControls) {
-        return { answer: lastText, conversationUrl: state.url };
+        return { answer: lastText, conversationUrl: lastUrl };
       }
       if (!state.isNew && Date.now() - startedAt >= NO_RESPONSE_TIMEOUT_MS) {
-        throw new GeminiBridgeError(
-          "NO_RESPONSE",
-          "Gemini 在 90 秒内没有返回任何回答。",
-          { retryable: true },
-        );
+        throw new GeminiBridgeError("NO_RESPONSE", "Gemini did not return an answer within 90 seconds.", {
+          ...context,
+          conversationUrl: lastUrl,
+          phase: BRIDGE_PHASES.SUBMITTED,
+        });
       }
       if (lastText.length > 0 && Date.now() - lastChangedAt >= STALLED_RESPONSE_TIMEOUT_MS) {
         throw new GeminiBridgeError(
           "RESPONSE_STALLED",
-          `Gemini 回答停滞，已收到 ${lastText.length} 个字符但未完成。`,
-          { partialChars: lastText.length, retryable: true },
+          `Gemini stopped generating after ${lastText.length} characters without completing.`,
+          {
+            ...context,
+            conversationUrl: lastUrl,
+            partialChars: lastText.length,
+            phase: BRIDGE_PHASES.GENERATING,
+          },
         );
       }
       await delay(750);
     }
     throw new GeminiBridgeError(
       "GENERATION_TIMEOUT",
-      `等待 Gemini 完整回答超过 3 分钟${lastText.length > 0 ? `；已收到 ${lastText.length} 个字符` : ""}。`,
-      { partialChars: lastText.length, retryable: true },
+      `Gemini did not complete within three minutes${lastText.length > 0 ? `; received ${lastText.length} characters` : ""}.`,
+      {
+        ...context,
+        conversationUrl: lastUrl,
+        partialChars: lastText.length,
+        phase: lastText.length > 0 ? BRIDGE_PHASES.GENERATING : BRIDGE_PHASES.SUBMITTED,
+      },
     );
   }
 
-  async runAttempt({ destination, language, question, reuseSession, signal, video }, onProgress) {
+  async runAttempt({ conversationId, destination, prompt, requestId, signal }, onProgress) {
     let client = null;
     let completed = false;
+    let conversationUrl = destination;
+    let phase = BRIDGE_PHASES.PRE_SUBMIT;
     let port = null;
     try {
-      port = await this.startBrowser();
+      port = await this.startBrowser(signal);
       ({ client } = await this.openTarget(port));
       await client.send("Page.navigate", { url: destination });
       await this.waitForComposer(client, onProgress, signal, destination);
-      if (reuseSession) await delay(4_000);
-      const requestMarker = `GW-${crypto.randomUUID()}`;
-      const prompt = `${buildGeminiPrompt({ language, question, url: video.url })}\n\n本地请求编号：${requestMarker}（无需在回答中重复）`;
-      await onProgress?.("正在向 Gemini Web 提交问题。", 25);
+      if (conversationId != null) await delay(4_000);
+      const requestMarker = `GW-${requestId}`;
+      const markedPrompt = `${prompt}\n\nLocal request marker: ${requestMarker} (do not repeat this marker in the answer)`;
+      await onProgress?.("Submitting a prompt to Gemini Web.", 25);
+      // Runtime.callFunctionOn may disconnect after the page has clicked Send.
+      // From this point onward, treat the outcome as submitted rather than risk a duplicate.
+      phase = BRIDGE_PHASES.SUBMITTED;
       const submission = await client.call(
         submitGeminiPrompt.toString(),
-        [prompt, requestMarker],
+        [markedPrompt, requestMarker],
         30_000,
       );
-      const result = await this.waitForAnswer(
-        client,
-        submission.before,
-        onProgress,
-        signal,
-      );
+      conversationUrl = submission.url ?? conversationUrl;
+      const result = await this.waitForAnswer(client, submission.before, onProgress, signal, {
+        conversationId,
+        conversationUrl,
+      });
       completed = true;
       return result;
     } catch (error) {
-      throw normalizeBridgeError(error);
+      throw normalizeBridgeError(error, { conversationId, conversationUrl, phase });
     } finally {
       if (client != null && !completed) {
         await client.call(cancelGeminiGeneration.toString(), [], 5_000).catch(() => {});
@@ -373,42 +544,87 @@ export class GeminiBrowserBridge {
     }
   }
 
-  async analyze({ language, question, signal, url }, onProgress) {
-    const video = canonicalizeYoutubeUrl(url);
-    const session = await getSession(video.videoId);
-    await onProgress?.(
-      session == null ? "正在新建 Gemini 视频会话。" : "正在打开已有视频会话。",
-      5,
-    );
-    let lastError = null;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const reuseSession = attempt === 0 && session != null;
-      const destination = reuseSession ? session.conversationUrl : GEMINI_HOME;
-      try {
-        const result = await this.runAttempt(
-          { destination, language, question, reuseSession, signal, video },
-          onProgress,
+  async ask({ conversationId = null, ownerThreadId = null, prompt, signal }, onProgress) {
+    const clean = cleanPrompt(prompt);
+    const requestId = crypto.randomUUID();
+    let conversation = null;
+    if (conversationId != null) {
+      conversation = await getConversation(conversationId);
+      if (conversation == null) {
+        throw new GeminiBridgeError(
+          "CONVERSATION_NOT_FOUND",
+          `No local Gemini conversation was found for ${conversationId}.`,
+          { conversationId },
         );
-        await saveSession(video.videoId, result.conversationUrl);
-        await onProgress?.("Gemini Web 回答已完成，后台浏览器已关闭。", 100);
-        return { ...result, video };
-      } catch (error) {
-        lastError = normalizeBridgeError(error);
-        if (shouldRetryBridgeError(lastError, attempt, signal?.aborted)) {
-          await onProgress?.(
-            `Gemini 临时失败（${lastError.code}），正在用全新后台会话自动重试一次。`,
-            60,
-          );
-          await delay(1_000);
-          continue;
-        }
-        break;
       }
     }
-    throw new GeminiBridgeError(
-      lastError?.code ?? "UNEXPECTED",
-      `${lastError?.message ?? "Gemini Web 分析失败。"}${lastError?.retryable ? " 已自动重试一次仍未恢复。" : ""}`,
-      { partialChars: lastError?.partialChars ?? 0 },
+
+    return withFileLock(
+      paths.browserLock,
+      { label: "Gemini Web browser", signal },
+      async () => {
+        let lastError = null;
+        const destination = conversation?.conversationUrl ?? GEMINI_HOME;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            const result = await this.runAttempt(
+              { conversationId, destination, prompt: clean, requestId, signal },
+              onProgress,
+            );
+            const savedId = await saveConversation(
+              {
+                conversationId,
+                conversationUrl: result.conversationUrl,
+                ownerThreadId,
+              },
+              signal,
+            );
+            await onProgress?.("Gemini Web returned a complete answer.", 100);
+            return { ...result, conversationId: savedId, requestId };
+          } catch (error) {
+            lastError = normalizeBridgeError(error, { conversationId });
+            if (lastError.conversationId == null && isSpecificConversationUrl(lastError.conversationUrl)) {
+              lastError.conversationId = await saveConversation(
+                { conversationUrl: lastError.conversationUrl, ownerThreadId },
+                signal,
+              );
+            }
+            if (shouldRetryBridgeError(lastError, attempt, signal?.aborted)) {
+              await onProgress?.("A pre-submit browser failure occurred; retrying once safely.", 15);
+              await delay(1_000);
+              continue;
+            }
+            throw lastError;
+          }
+        }
+        throw lastError;
+      },
     );
   }
+
+  async analyze({ language, question, signal, url }, onProgress) {
+    const video = canonicalizeYoutubeUrl(url);
+    const legacy = await findLegacyConversation(video.videoId);
+    const result = await this.ask(
+      {
+        conversationId: legacy?.conversationId ?? null,
+        ownerThreadId: process.env.CODEX_THREAD_ID ?? null,
+        prompt: buildGeminiPrompt({ language, question, url: video.url }),
+        signal,
+      },
+      onProgress,
+    );
+    await saveConversation(
+      {
+        conversationId: result.conversationId,
+        conversationUrl: result.conversationUrl,
+        legacyVideoId: video.videoId,
+        ownerThreadId: process.env.CODEX_THREAD_ID ?? null,
+      },
+      signal,
+    );
+    return { ...result, video };
+  }
 }
+
+export { GEMINI_HOME, MAX_PROMPT_CHARS, normalizeBridgeError };

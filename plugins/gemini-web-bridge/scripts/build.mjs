@@ -6,23 +6,31 @@ import { build } from "esbuild";
 
 const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDirectory = join(pluginRoot, "dist");
-const outputFile = join(outputDirectory, "mcp-server.mjs");
+const outputFiles = [
+  join(outputDirectory, "gemini-web-cli.mjs"),
+  join(outputDirectory, "mcp-server.mjs"),
+];
 
 await mkdir(outputDirectory, { recursive: true });
 
 const result = await build({
   absWorkingDir: pluginRoot,
   bundle: true,
-  entryPoints: ["scripts/mcp-server.mjs"],
+  entryNames: "[name]",
+  entryPoints: {
+    "gemini-web-cli": "scripts/cli.mjs",
+    "mcp-server": "scripts/mcp-server.mjs",
+  },
   format: "esm",
   legalComments: "external",
   metafile: true,
-  outfile: outputFile,
+  outExtension: { ".js": ".mjs" },
+  outdir: outputDirectory,
   platform: "node",
   target: "node22",
 });
 
-await chmod(outputFile, 0o755);
+for (const outputFile of outputFiles) await chmod(outputFile, 0o755);
 
 function packageRootForInput(input) {
   const normalized = input.split("/");
